@@ -174,6 +174,7 @@ class MarketOrder:
             return
 
         timeout_duration = float(self.config.get("receive_timeout", 30))
+        stop_on_trade_response = bool(self.config.get("stop_on_trade_response", True))
 
         for attempt in range(max_retries):
             try:
@@ -185,6 +186,7 @@ class MarketOrder:
                 logger.log_out("info", f"账号 {account_name} - 已发送交易请求: {self.order_data['eventData']}")
 
                 message_count = 0
+                got_trade_response = False
                 while True:
                     try:
                         message = await asyncio.wait_for(websocket.recv(), timeout=timeout_duration)
@@ -193,6 +195,10 @@ class MarketOrder:
 
                         if message_data.get("eventType") == "marketOrder":
                             logger.log_out("info", f"账号 {account_name} - 收到交易响应: {message_data}")
+                            got_trade_response = True
+                            if stop_on_trade_response:
+                                logger.log_out("info", f"账号 {account_name} - 已收到交易响应，结束接收并关闭连接")
+                                break
                         else:
                             logger.log_out("debug", f"账号 {account_name} - 收到消息: {message_data}")
 
@@ -203,8 +209,30 @@ class MarketOrder:
                         logger.log_out("error", f"账号 {account_name} - 消息解析失败: {err!r}")
                         continue
                     except Exception as err:
-                        # 连接被关闭等情况在不同 websockets 版本里可能抛不同异常，这里统一当作“本次结束”
-                        logger.log_out("warning", f"账号 {account_name} - 接收中断: {err!r}")
+                        # 连接关闭在不同 websockets 版本会抛不同异常；这里动态识别并降级为“正常结束”。
+                        exc_mod = getattr(websockets, "exceptions", None) if websockets is not None else None
+                        conn_closed = getattr(exc_mod, "ConnectionClosed", None) if exc_mod is not None else None
+                        conn_closed_ok = getattr(exc_mod, "ConnectionClosedOK", None) if exc_mod is not None else None
+                        conn_closed_err = getattr(exc_mod, "ConnectionClosedError", None) if exc_mod is not None else None
+
+                        is_closed = bool(conn_closed is not None and isinstance(err, conn_closed))
+                        if is_closed:
+                            code = getattr(err, "code", None)
+                            reason = getattr(err, "reason", None)
+
+                            # 如果已经拿到交易响应，服务端立即断开通常是预期行为：降级为 info
+                            if got_trade_response:
+                                logger.log_out("info", f"账号 {account_name} - 连接已关闭(code={code}, reason={reason})")
+                            # 1000/ConnectionClosedOK 通常为正常关闭：不报 warning
+                            elif (conn_closed_ok is not None and isinstance(err, conn_closed_ok)) or code == 1000:
+                                logger.log_out("info", f"账号 {account_name} - 连接正常关闭(code={code}, reason={reason})")
+                            # ConnectionClosedError 更像异常关闭，但不应再打印“接收中断”造成误解
+                            elif conn_closed_err is not None and isinstance(err, conn_closed_err):
+                                logger.log_out("warning", f"账号 {account_name} - 连接异常关闭(code={code}, reason={reason})")
+                            else:
+                                logger.log_out("warning", f"账号 {account_name} - 连接已关闭(code={code}, reason={reason})")
+                        else:
+                            logger.log_out("warning", f"账号 {account_name} - 接收中断: {err!r}")
                         break
 
                 return  # 成功完成本次流程，不再重试
