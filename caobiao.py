@@ -224,20 +224,35 @@ class GetOrderIds:
         ok_count = 0
         fail_count = 0
 
-        # 流式回收结果，避免一次性 gather 占用更大内存
-        for fut in asyncio.as_completed(tasks):
-            result = await fut
-            self.order_ids[result.account_name] = result.order_ids
-            self.order_count_by_account[result.account_name] = len(result.order_ids)
-            self.total_order_count += len(result.order_ids)
+        # 关键修复：
+        # Windows + aiohttp(aiohappyeyeballs) 下，如果外部取消/异常导致提前退出，
+        # 必须在 finally 中 cancel + await 回收所有未完成任务，否则会出现：
+        # "Task was destroyed but it is pending!"
+        try:
+            # 流式回收结果，避免一次性 gather 占用更大内存
+            for fut in asyncio.as_completed(tasks):
+                result = await fut
+                self.order_ids[result.account_name] = result.order_ids
+                self.order_count_by_account[result.account_name] = len(result.order_ids)
+                self.total_order_count += len(result.order_ids)
 
-            if result.ok:
-                ok_count += 1
-                if not result.order_ids:
-                    self.accounts_without_orders.append(result.account_name)
-            else:
-                fail_count += 1
-                self.failed_accounts[result.account_name] = result.error or "未知原因"
+                if result.ok:
+                    ok_count += 1
+                    if not result.order_ids:
+                        self.accounts_without_orders.append(result.account_name)
+                else:
+                    fail_count += 1
+                    self.failed_accounts[result.account_name] = result.error or "未知原因"
+        except asyncio.CancelledError:
+            logger.log_out("warning", "get_order_ids 被取消，正在回收未完成任务...")
+            raise
+        finally:
+            pending = [t for t in tasks if not t.done()]
+            if pending:
+                for t in pending:
+                    t.cancel()
+                # 必须 await，确保所有取消传播完成，避免事件循环关闭时出现 pending task 告警
+                await asyncio.gather(*pending, return_exceptions=True)
 
         # 统计输出
         logger.log_out("info", "=" * 50)
@@ -262,6 +277,8 @@ class GetOrderIds:
         if self.session and not self.session.closed:
             try:
                 await self.session.close()
+                # 给事件循环一个机会处理 connector 内部取消（Windows 下更常见）
+                await asyncio.sleep(0)
                 logger.log_out("info", "aiohttp会话已关闭")
             except RuntimeError as e:
                 if "Event loop is closed" in str(e):
