@@ -48,6 +48,19 @@ class CloseOrderMore:
         self.closed_orders: int = 0  # 复查后确认已平仓数量
         self.unclosed_orders: Dict[str, List[str]] = {}  # account -> 未平仓订单ID列表
 
+        # 关键修复：显式追踪所有后台 Task，确保退出时可取消并等待，避免 loop 关闭阶段触发
+        # “coroutine ignored GeneratorExit”
+        self._tracked_tasks: "set[asyncio.Task]" = set()
+
+    def _track_task(self, task: "asyncio.Task") -> None:
+        """追踪任务，完成后自动移除（不新增类，仅新增一个内部工具方法）。"""
+        self._tracked_tasks.add(task)
+
+        def _done(_t: "asyncio.Task") -> None:
+            self._tracked_tasks.discard(_t)
+
+        task.add_done_callback(_done)
+
     async def __aenter__(self):
         """支持异步上下文管理器"""
         await self.initialize()
@@ -217,6 +230,7 @@ class CloseOrderMore:
                         return message_count
 
                     receive_task = asyncio.create_task(receive_messages(websocket, account_name))
+                    self._track_task(receive_task)
 
                     # 批量发送平仓请求（优化：局部绑定减少属性查找）
                     send = websocket.send
@@ -329,7 +343,11 @@ class CloseOrderMore:
 
         while idx < total_accounts:
             sub = HEADERS[idx: idx + chunk_size]
-            tasks = [asyncio.create_task(self.process_single_account(account_name, headers)) for account_name, headers in sub]
+            tasks = []
+            for account_name, headers in sub:
+                t = asyncio.create_task(self.process_single_account(account_name, headers))
+                self._track_task(t)
+                tasks.append(t)
 
             try:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -374,6 +392,18 @@ class CloseOrderMore:
 
     async def close(self):
         """清理资源的方法"""
+        # 关键修复：退出时先取消并等待所有仍在运行的任务，避免事件循环关闭时协程被 GC 引发
+        # “coroutine ignored GeneratorExit”
+        pending = [t for t in list(self._tracked_tasks) if not t.done()]
+        if pending:
+            for t in pending:
+                t.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                # 超时也不阻塞退出，继续清理会话资源
+                pass
+
         if self.session and not self.session.closed:
             try:
                 await self.session.close()
@@ -398,7 +428,9 @@ async def main():
         except KeyboardInterrupt:
             logger.log_out("info", "用户中断程序执行")
         except asyncio.CancelledError:
+            # 关键修复：不要吞掉取消信号，否则 asyncio.run 关闭 loop 时可能触发 GeneratorExit 相关报错
             logger.log_out("info", "任务被取消")
+            raise
         except Exception as error:
             logger.log_out("error", f"程序执行失败: {str(error)}")
 
