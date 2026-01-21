@@ -147,6 +147,9 @@ class CloseOrderMore:
                     # 高频日志会显著拖慢总耗时，如需可在 logger 配置控制级别
                     logger.log_out("info", f"账户{account_name}的持仓订单ID有: {all_order_ids}")
                     return all_order_ids
+        except asyncio.CancelledError:
+            # 关键修复：不要吞掉取消信号，否则容易在退出时触发 coroutine ignored GeneratorExit
+            raise
         except aiohttp.ClientError as e:
             logger.log_out("error", f"账户{account_name}获取订单ID网络错误: {str(e)}")
         except json.JSONDecodeError as e:
@@ -206,6 +209,9 @@ class CloseOrderMore:
                                     break
                                 except websockets.exceptions.WebSocketException:
                                     break
+                        except asyncio.CancelledError:
+                            # 关键修复：取消时要向上抛出，避免协程在 GC 阶段触发 GeneratorExit 报错
+                            raise
                         except Exception as e:
                             log_out("error", f"账户 {acc_name} 接收消息时发生错误: {str(e)}")
                         return message_count
