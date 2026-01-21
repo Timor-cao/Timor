@@ -3,6 +3,7 @@
 
 import ast
 import asyncio
+import time
 import sys
 import warnings
 from typing import Dict, List, Tuple, Optional
@@ -39,6 +40,13 @@ class CloseOrderMore:
         self.tokens: Dict[str, str] = {}
         self.accounts_headers: List[Tuple[str, Dict[str, str]]] = []
         self.session: Optional[aiohttp.ClientSession] = None  # 复用的aiohttp会话
+
+        # 统计信息（线程安全：用锁保护共享计数/集合）
+        self._stats_lock: asyncio.Lock = asyncio.Lock()
+        self.start_ts: float = 0.0
+        self.total_orders: int = 0  # 初始持仓订单总数（尝试平仓的订单数）
+        self.closed_orders: int = 0  # 复查后确认已平仓数量
+        self.unclosed_orders: Dict[str, List[str]] = {}  # account -> 未平仓订单ID列表
 
     async def __aenter__(self):
         """支持异步上下文管理器"""
@@ -82,6 +90,11 @@ class CloseOrderMore:
         self.semaphore = asyncio.Semaphore(self.max_concurrent)  # 兼容保留
         self.http_semaphore = asyncio.Semaphore(http_limit)
         self.ws_semaphore = asyncio.Semaphore(ws_limit)
+
+        self.start_ts = time.perf_counter()
+        self.total_orders = 0
+        self.closed_orders = 0
+        self.unclosed_orders = {}
 
     async def generate_header(self):
         """生成每个账号的 headers"""
@@ -251,9 +264,44 @@ class CloseOrderMore:
 
     async def process_single_account(self, account_name: str, headers: Dict[str, str]):
         """处理单个账户的完整流程"""
+        # BUG修复/优化：平仓后增加“复查持仓”确认是否已平仓，统计未平仓订单号
         all_order_ids = await self.get_order_ids(account_name, headers)
-        if all_order_ids:
-            await self.send_close_orders_request(account_name, headers, all_order_ids)
+        if not all_order_ids:
+            return
+
+        # 统计：该账号初始需要平仓的订单数
+        async with self._stats_lock:
+            self.total_orders += len(all_order_ids)
+
+        await self.send_close_orders_request(account_name, headers, all_order_ids)
+
+        # 复查：轮询持仓，尽量快速确认（避免过长等待影响吞吐）
+        check_times = int(self.config.get("check_times", 2))
+        check_interval = float(self.config.get("check_interval", 0.2))
+        check_times = max(1, check_times)
+        check_interval = max(0.0, check_interval)
+
+        remaining_ids: Optional[set] = None
+        target_set = set(all_order_ids)
+
+        for _ in range(check_times):
+            if check_interval > 0:
+                await asyncio.sleep(check_interval)
+            current = await self.get_order_ids(account_name, headers)
+            cur_set = set(current)
+            remaining = sorted(target_set.intersection(cur_set))
+            remaining_ids = set(remaining)
+            if not remaining:
+                break
+
+        if remaining_ids is None:
+            remaining_ids = set(all_order_ids)
+
+        closed = len(target_set) - len(remaining_ids)
+        async with self._stats_lock:
+            self.closed_orders += closed
+            if remaining_ids:
+                self.unclosed_orders[account_name] = sorted(list(remaining_ids))
 
     async def send_subscribe_request(self):
         """为所有用户发送平仓请求"""
@@ -301,6 +349,22 @@ class CloseOrderMore:
 
         logger.log_out("info", f"所有账号处理完成: 成功 {success_count_total} 个，失败 {failure_count_total} 个")
         logger.log_out("info", f"所有 {total_accounts} 个账号的平仓请求处理完成")
+
+        # 统计输出：耗时、平仓数量、未平仓订单号
+        elapsed = time.perf_counter() - self.start_ts if self.start_ts else 0.0
+        async with self._stats_lock:
+            total_orders = self.total_orders
+            closed_orders = self.closed_orders
+            unclosed = dict(self.unclosed_orders)
+
+        unclosed_count = sum(len(v) for v in unclosed.values())
+        logger.log_out("info", f"执行总耗时: {elapsed:.3f}s")
+        logger.log_out("info", f"订单统计: 尝试平仓 {total_orders} 笔，确认已平仓 {closed_orders} 笔，未平仓 {unclosed_count} 笔")
+        if unclosed_count:
+            # 只打印未平仓订单，便于直接复制处理
+            for acc, ids in unclosed.items():
+                if ids:
+                    logger.log_out("warning", f"账号 {acc} 未平仓订单号: {ids}")
 
     async def close(self):
         """清理资源的方法"""
