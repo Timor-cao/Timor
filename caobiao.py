@@ -1,13 +1,10 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# -*- coding:utf-8 -*-
 """
  @ Date   : 2026/1/21
  @ Author : Administrator
  @ Description :
-   WebSocket 市价单批量开仓脚本（修复BUG并优化资源管理/并发/重试）
 """
-
-from __future__ import annotations
 
 import ast
 import asyncio
@@ -15,40 +12,14 @@ import itertools
 import json
 import platform
 import sys
-import time
 import warnings
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import websockets
 
-
-# 兼容在仓库缺失依赖时仍可运行（尽量不影响你原有工程结构）
-try:
-    from MT.Flopotech.BaseMethod.log_module import logger  # type: ignore
-except Exception:  # pragma: no cover
-    class _FallbackLogger:
-        def log_out(self, level: str, msg: str) -> None:
-            ts = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{ts}][{level.upper()}] {msg}", file=sys.stderr if level.lower() in {"error", "warning"} else sys.stdout)
-
-    logger = _FallbackLogger()
-
-try:
-    from MT.Flopotech.Config.More_Account import WEBSOCKET_PRIVATE_CONFIG  # type: ignore
-except Exception:  # pragma: no cover
-    WEBSOCKET_PRIVATE_CONFIG = {
-        "websocket_url": "wss://example.invalid/ws",
-        "client_ids": ["demo-client-id"],
-        "receive_timeout": 0.3,
-    }
-
-try:
-    from MT.Flopotech.BaseMethod.operate_config import OperateConfig  # type: ignore
-except Exception:  # pragma: no cover
-    class OperateConfig:  # 最小兜底，避免 import 失败导致无法运行
-        def get_ini_value(self, section: str, key: str) -> str:
-            raise RuntimeError("缺少 MT.Flopotech 依赖：无法读取 tokens 配置")
+from MT.Flopotech.BaseMethod.log_module import logger
+from MT.Flopotech.BaseMethod.operate_config import OperateConfig
+from MT.Flopotech.Config.More_Account import WEBSOCKET_PRIVATE_CONFIG
 
 
 def setup_event_loop_policy() -> None:
@@ -69,11 +40,8 @@ def _normalize_tokens(tokens_obj: Any) -> List[Tuple[str, str]]:
     """
     if tokens_obj is None:
         return []
-
     if isinstance(tokens_obj, Mapping):
-        items = list(tokens_obj.items())
-        return [(str(k), str(v)) for k, v in items]
-
+        return [(str(k), str(v)) for k, v in tokens_obj.items()]
     if isinstance(tokens_obj, (list, tuple)):
         out: List[Tuple[str, str]] = []
         for item in tokens_obj:
@@ -82,39 +50,23 @@ def _normalize_tokens(tokens_obj: Any) -> List[Tuple[str, str]]:
             else:
                 raise ValueError(f"tokens 列表元素格式不正确: {item!r}")
         return out
-
     raise ValueError(f"不支持的 tokens 类型: {type(tokens_obj)!r}")
-
-
-@dataclass(frozen=True)
-class AccountHeader:
-    account_name: str
-    headers: Dict[str, str]
 
 
 class MarketOrder:
     """市价单开仓"""
 
-    def __init__(
-        self,
-        *,
-        batch_size: int = 10,
-        sleep_time: float = 0.1,
-        max_retries: int = 2,
-        retry_backoff_base: float = 1.0,
-    ) -> None:
-        self.batch_size = max(1, int(batch_size))
-        self.sleep_time = max(0.0, float(sleep_time))
-        self.max_retries = max(1, int(max_retries))
-        self.retry_backoff_base = max(0.0, float(retry_backoff_base))
+    def __init__(self):
+        # 性能优化：默认并发数加大，并避免每批 sleep（可通过配置覆盖）
+        self.config = WEBSOCKET_PRIVATE_CONFIG
+        self.batch_size = int(self.config.get("batch_size", 100))  # 实际并发上限（也用于兼容旧逻辑的“批大小”概念）
+        self.sleep_time = float(self.config.get("sleep_time", 0.0))  # 批与批之间 sleep（提速默认 0）
 
-        self.config: Dict[str, Any] = dict(WEBSOCKET_PRIVATE_CONFIG)
-        client_ids = self.config.get("client_ids") or []
-        if not isinstance(client_ids, (list, tuple)) or not client_ids:
-            raise ValueError("配置 WEBSOCKET_PRIVATE_CONFIG['client_ids'] 不能为空且必须为 list/tuple")
-        self.client_id_cycle = itertools.cycle([str(x) for x in client_ids])
+        self.client_id_cycle = itertools.cycle(self.config["client_ids"])
+        self.tokens = {}
+        self.accounts_headers = {}
 
-        self.order_data: Dict[str, Any] = {
+        self.order_data = {
             "eventType": "marketOrder",
             "eventData": {
                 "action": "open",
@@ -127,198 +79,183 @@ class MarketOrder:
             },
         }
 
-        # 跟踪后台接收任务（用 set 更适合 add/remove）
-        self._background_tasks: "set[asyncio.Task[Any]]" = set()
+        # 性能优化：用 set 跟踪后台任务，增删为 O(1)
+        self.background_tasks: "set[asyncio.Task]" = set()
+        # 性能优化：用信号量控制并发，避免“分批+sleep”带来的节奏开销
+        self._semaphore = asyncio.Semaphore(max(1, int(self.config.get("max_concurrency", self.batch_size))))
 
-    async def generate_headers(self) -> List[AccountHeader]:
-        """生成每个账号的 headers。"""
+        # 重试参数（可配置）
+        self._max_retries = int(self.config.get("max_retries", 2))
+        self._retry_delay = float(self.config.get("retry_delay", 0.5))  # 提速：默认比原来更短
+
+    async def generate_header(self):
+        """生成每个账号的 headers"""
         try:
             tokens_str = OperateConfig().get_ini_value("PARAMS", "tokens")
             tokens_obj = ast.literal_eval(tokens_str)
             pairs = _normalize_tokens(tokens_obj)
-            if not pairs:
-                logger.log_out("error", "tokens 为空，无法生成请求头")
-                return []
 
-            out: List[AccountHeader] = []
+            accounts_headers: List[Tuple[str, Dict[str, str]]] = []
+            next_client_id = self.client_id_cycle.__next__
             for account, token in pairs:
                 headers = {
                     "Access-Token": token,
-                    "Client-ID": next(self.client_id_cycle),
+                    "Client-ID": next_client_id(),
                 }
-                out.append(AccountHeader(account_name=str(account), headers=headers))
-            return out
+                accounts_headers.append((str(account), headers))
+
+            self.accounts_headers = accounts_headers
+            return self.accounts_headers
+        except KeyboardInterrupt:
+            logger.log_out("info", "用户中断程序执行")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.log_out("error", f"生成请求头失败: {e!s}")
+            logger.log_out("error", f"生成请求头失败: {str(e)}")
             return []
 
-    async def _receive_websocket_messages(
-        self,
-        websocket: websockets.WebSocketClientProtocol,
-        account_name: str,
-        timeout_duration: float,
-    ) -> int:
-        """
-        接收 WebSocket 消息（后台执行）。
-        - 超过 timeout_duration 没收到消息则退出
-        - 退出前确保关闭连接
-        """
+    async def receive_websocket_messages(self, websocket, account_name, timeout_duration):
+        """接收WebSocket消息（后台执行）"""
         message_count = 0
         try:
+            # 小优化：本地化引用，减少属性查找
+            recv = websocket.recv
+            log_out = logger.log_out
+            loads = json.loads
+
             while True:
                 try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=timeout_duration)
+                    message = await asyncio.wait_for(recv(), timeout=timeout_duration)
                     try:
-                        message_data = json.loads(message)
+                        message_data = loads(message)
                     except json.JSONDecodeError:
-                        logger.log_out("warning", f"账号 {account_name} - 消息不是合法 JSON: {message!r}")
+                        # 不让异常路径拖慢主流程
+                        log_out("warning", f"账号 {account_name} - 消息解析失败(非JSON): {message!r}")
                         continue
                     message_count += 1
-                    logger.log_out("debug", f"账号 {account_name} - 收到消息: {message_data}")
+                    log_out("debug", f"账号 {account_name} - 收到消息: {message_data}")
+
                 except asyncio.TimeoutError:
-                    logger.log_out("info", f"账号 {account_name} - 接收结束，共接收 {message_count} 条消息")
+                    log_out("info", f"账号 {account_name} - 接收消息完成，共接收 {message_count} 条消息")
                     break
-        except asyncio.CancelledError:
-            # close() 时可能取消任务，确保连接关闭
-            raise
-        except Exception as e:
-            logger.log_out("warning", f"账号 {account_name} - 接收消息异常: {e!s}")
+                except json.JSONDecodeError as errord:
+                    log_out("error", f"账号 {account_name} - 消息解析失败: {str(errord)}")
+                    continue
         finally:
+            # 确保WebSocket连接被关闭
             if websocket and not websocket.closed:
                 try:
                     await websocket.close()
                     logger.log_out("info", f"账号 {account_name} - WebSocket 连接已关闭")
-                except Exception as e:
-                    logger.log_out("warning", f"账号 {account_name} - 关闭连接时出错: {e!s}")
+                except Exception as errori:
+                    logger.log_out("warning", f"账号 {account_name} - 关闭 WebSocket 连接时出错: {str(errori)}")
         return message_count
 
-    def _track_background_task(self, task: "asyncio.Task[Any]") -> None:
-        self._background_tasks.add(task)
+    async def send_trading_request(self, account_name, headers):
+        """发送交易请求（发送后立即返回）"""
+        websocket = None
 
-        def _done_callback(t: "asyncio.Task[Any]") -> None:
-            self._background_tasks.discard(t)
+        url = self.config["websocket_url"]
+        timeout_duration = float(self.config.get("receive_timeout", 0.1))
+        max_retries = max(1, int(self._max_retries))
+        retry_delay = max(0.0, float(self._retry_delay))
 
-        task.add_done_callback(_done_callback)
+        # 性能优化：控制并发，避免分批+sleep 的吞吐损失
+        async with self._semaphore:
+            for attempt in range(max_retries):
+                try:
+                    websocket = await websockets.connect(
+                        url,
+                        extra_headers=headers,
+                        close_timeout=10,
+                        ping_interval=30,
+                        ping_timeout=10,
+                        open_timeout=float(self.config.get("open_timeout", 3)),  # 提速：连接失败更快返回
+                    )
+                    logger.log_out("info", f"账号 {account_name} - WebSocket 连接成功")
 
-    async def send_trading_request(self, account_name: str, headers: Dict[str, str]) -> None:
-        """连接 WebSocket -> 发送交易请求 -> 后台接收（本协程不等待接收完成）。"""
-        url = self.config.get("websocket_url")
-        if not url:
-            logger.log_out("error", "配置 websocket_url 为空，无法连接")
-            return
+                    request_message = json.dumps(self.order_data, ensure_ascii=False)
+                    await websocket.send(request_message)
+                    logger.log_out("info", f"账号 {account_name} - 已发送交易请求: {self.order_data['eventData']}")
 
-        timeout_duration = float(self.config.get("receive_timeout", 0.3))
-        timeout_duration = max(0.05, timeout_duration)
+                    # 发送成功后，创建后台任务接收消息，不再等待
+                    receive_task = asyncio.create_task(
+                        self.receive_websocket_messages(websocket, account_name, timeout_duration)
+                    )
+                    self.background_tasks.add(receive_task)
 
-        websocket: Optional[websockets.WebSocketClientProtocol] = None
+                    def task_done_callback(task):
+                        self.background_tasks.discard(task)
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                websocket = await websockets.connect(
-                    str(url),
-                    extra_headers=headers,
-                    close_timeout=10,
-                    ping_interval=30,
-                    ping_timeout=10,
-                )
-                logger.log_out("info", f"账号 {account_name} - WebSocket 连接成功")
+                    receive_task.add_done_callback(task_done_callback)
+                    break
 
-                request_message = json.dumps(self.order_data, ensure_ascii=False)
-                await websocket.send(request_message)
-                logger.log_out("info", f"账号 {account_name} - 已发送交易请求: {self.order_data.get('eventData')}")
+                except websockets.exceptions.WebSocketException as errorf:
+                    logger.log_out("error", f"账号 {account_name} - WebSocket 连接失败 (尝试 {attempt + 1}): {str(errorf)}")
+                    if attempt < max_retries - 1 and retry_delay > 0:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                    else:
+                        logger.log_out("error", f"账号 {account_name} - WebSocket 连接最终失败，已达到最大重试次数")
+                        if websocket and not websocket.closed:
+                            await websocket.close()
 
-                # 创建后台接收任务，连接由接收任务负责关闭
-                receive_task = asyncio.create_task(
-                    self._receive_websocket_messages(websocket, account_name, timeout_duration)
-                )
-                self._track_background_task(receive_task)
-                return
+                except Exception as errorg:
+                    logger.log_out("error", f"账号 {account_name} - 发生未预期的错误 (尝试 {attempt + 1}): {str(errorg)}")
+                    if attempt < max_retries - 1 and retry_delay > 0:
+                        await asyncio.sleep(retry_delay * (attempt + 1))
+                    else:
+                        logger.log_out("error", f"账号 {account_name} - 操作最终失败，已达到最大重试次数")
+                        if websocket and not websocket.closed:
+                            await websocket.close()
 
-            except (websockets.exceptions.WebSocketException, OSError) as e:
-                logger.log_out("error", f"账号 {account_name} - WebSocket 连接/发送失败(第 {attempt}/{self.max_retries} 次): {e!s}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.log_out("error", f"账号 {account_name} - 未预期异常(第 {attempt}/{self.max_retries} 次): {e!s}")
-            finally:
-                # 如果没成功创建接收任务，就在这里释放连接
-                if websocket is not None and websocket.closed is False:
-                    try:
-                        await websocket.close()
-                    except Exception:
-                        pass
-                websocket = None
-
-            if attempt < self.max_retries:
-                delay = self.retry_backoff_base * attempt
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-        logger.log_out("error", f"账号 {account_name} - 已达到最大重试次数，放弃本次请求")
-
-    async def send_subscribe_request(self) -> None:
-        """为每个用户分别发送交易请求（分批并发）。"""
-        headers_list = await self.generate_headers()
-        if not headers_list:
+    async def send_subscribe_request(self):
+        """为每个用户的header分别发送交易请求"""
+        HEADERS = await self.generate_header()
+        if not HEADERS:
             logger.log_out("error", "无法获取用户请求头，跳过交易请求")
             return
 
-        total_accounts = len(headers_list)
-        batch_size = self.batch_size
+        # 性能优化：不再严格“分批+等待”，改为一次性调度全部任务，由 semaphore 控制并发上限
+        tasks = []
+        for account_name, headers in HEADERS:
+            logger.log_out("info", f"开始发送交易请求,账号:{account_name} ...")
+            tasks.append(asyncio.create_task(self.send_trading_request(account_name, headers)))
 
-        for batch_start in range(0, total_accounts, batch_size):
-            batch_end = min(batch_start + batch_size, total_accounts)
-            current_batch = headers_list[batch_start:batch_end]
-            batch_no = batch_start // batch_size + 1
-
-            logger.log_out("info", f"开始处理第 {batch_no} 批账号，共 {len(current_batch)} 个账号")
-
-            tasks: List[asyncio.Task[None]] = []
-            for item in current_batch:
-                logger.log_out("info", f"开始发送交易请求,账号: {item.account_name} ...")
-                tasks.append(asyncio.create_task(self.send_trading_request(item.account_name, item.headers)))
-
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for idx, r in enumerate(results):
-                    if isinstance(r, Exception):
-                        logger.log_out("error", f"第 {batch_no} 批 - 任务 {idx} 发送任务异常: {r!s}")
-                logger.log_out("info", f"第 {batch_no} 批账号的交易请求发送完成")
-
-            if batch_end < total_accounts and self.sleep_time > 0:
-                logger.log_out("info", f"等待 {self.sleep_time} 秒后处理下一批账号...")
+            # 兼容保留：如果你仍希望节流，可在配置里设置 sleep_time > 0
+            if self.sleep_time > 0:
                 await asyncio.sleep(self.sleep_time)
 
-        logger.log_out("info", "所有批次交易请求已发送完成")
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.log_out("error", f"任务 {i} 发送失败: {str(result)}")
 
-    async def close(self, *, wait_timeout: float = 5.0) -> None:
-        """清理资源：等待后台接收任务完成（带超时）。"""
-        tasks = list(self._background_tasks)
-        if not tasks:
-            logger.log_out("info", "无后台接收任务需要等待")
-            return
+        logger.log_out("info", "All accounts transaction requests sent completed")
 
-        logger.log_out("info", f"等待 {len(tasks)} 个后台接收任务完成（超时 {wait_timeout} 秒）...")
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=wait_timeout)
-        except asyncio.TimeoutError:
-            logger.log_out("warning", "等待后台任务超时，将取消剩余任务")
-            for t in list(self._background_tasks):
-                t.cancel()
-            await asyncio.gather(*list(self._background_tasks), return_exceptions=True)
-        finally:
-            self._background_tasks.clear()
-            # 留一点时间给底层连接完成 close handshake
-            await asyncio.sleep(0.1)
-            logger.log_out("info", "资源清理完成")
+    async def close(self):
+        """Ways to Clean Up Resources"""
+        if self.background_tasks:
+            logger.log_out("info", f"Wait for {len(self.background_tasks)} background receive tasks to complete...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self.background_tasks), return_exceptions=True),
+                    timeout=float(self.config.get("close_wait_timeout", 5.0)),
+                )
+            except asyncio.TimeoutError:
+                logger.log_out("warning", "等待后台接收任务超时，取消剩余任务")
+                for t in list(self.background_tasks):
+                    t.cancel()
+                await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
+
+        await asyncio.sleep(0.1)
+        logger.log_out("info", "Resource Cleanup Completed")
 
 
-async def main() -> None:
+async def main():
     market_order = MarketOrder()
     try:
-        logger.log_out("info", "开始发送 WebSocket 交易请求...")
+        logger.log_out("info", "Start WebSocket sending request...")
         await market_order.send_subscribe_request()
     finally:
         await market_order.close()
@@ -329,6 +266,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.log_out("info", "用户中断程序执行")
-    except Exception as e:
-        logger.log_out("error", f"程序执行失败: {e!s}")
+        logger.log_out("info", "User Interrupts Program Execution")
+    except Exception as errorh:
+        logger.log_out("error", f"Program execution failed: {str(errorh)}")
