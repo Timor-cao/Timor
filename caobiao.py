@@ -383,7 +383,7 @@ class MarketOrder:
         )
 
     async def _wait_for_responses(self, connections: List[ConnectionInfo]) -> None:
-        receive_timeout = max(0.0, _to_float(self.config.get("receive_timeout", 0), 0.0))
+        receive_timeout = max(0.0, _to_float(self.config.get("receive_timeout", 5), 5.0))
         if receive_timeout <= 0:
             logger.log_out("warning", "receive_timeout <= 0, skip waiting for responses")
             return
@@ -424,6 +424,11 @@ class MarketOrder:
             return
 
         self._connections = connections
+        logger.log_out(
+            "info",
+            f"Send plan: {self.target_rate}/s for {self.target_duration}s, "
+            f"connections={len(connections)}",
+        )
         stats = SendStats(duration=self.target_duration, rate=self.target_rate)
         send_queue: asyncio.Queue = asyncio.Queue()
         self._sender_tasks = [
