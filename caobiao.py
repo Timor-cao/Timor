@@ -27,7 +27,15 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 def setup_event_loop_policy() -> None:
     """Call before asyncio.run (Windows compatibility)."""
     if platform.system() == "Windows" and sys.version_info >= (3, 8):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        force_selector = bool(WEBSOCKET_PRIVATE_CONFIG.get("force_selector_loop", False))
+        if force_selector:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+            logger.log_out(
+                "warning",
+                "force_selector_loop enabled; select() has fd limits on Windows.",
+            )
+        else:
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     warnings.filterwarnings("ignore", category=ResourceWarning)
     warnings.filterwarnings("ignore", category=RuntimeWarning)
 
