@@ -1,340 +1,286 @@
-#!/usr/bin/env python3
-import argparse
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+"""
+ @ Date   : 2026/1/21
+ @ Author : Administrator
+ @ Description :
+"""
+import ast
 import asyncio
+import itertools
+import json
+import platform
 import sys
 import time
-from collections import Counter
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Tuple
 
-try:
-    import aiohttp
-except ImportError:  # pragma: no cover - runtime guard
-    print(
-        "Missing dependency 'aiohttp'. Install with: pip install aiohttp",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+import websockets
+
+from MT.Flopotech.BaseMethod.log_module import logger
+from MT.Flopotech.Config.More_Account import WEBSOCKET_PRIVATE_CONFIG
+from MT.Flopotech.BaseMethod.operate_config import OperateConfig
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-@dataclass
-class Stats:
-    sent: int = 0
-    completed: int = 0
-    success: int = 0
-    failed: int = 0
-    validation_failed: int = 0
-    bytes_received: int = 0
-    latency_sum: float = 0.0
-    latency_min: Optional[float] = None
-    latency_max: Optional[float] = None
-    status_counts: Counter = field(default_factory=Counter)
-    error_counts: Counter = field(default_factory=Counter)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-
-    async def record_sent(self, count: int) -> None:
-        async with self.lock:
-            self.sent += count
-
-    async def record_response(
-        self,
-        status: int,
-        ok: bool,
-        latency: float,
-        body_size: int,
-        validation_failed: bool,
-    ) -> None:
-        async with self.lock:
-            self.completed += 1
-            if ok:
-                self.success += 1
-            else:
-                self.failed += 1
-                if validation_failed:
-                    self.validation_failed += 1
-            self.status_counts[status] += 1
-            self.bytes_received += body_size
-            self.latency_sum += latency
-            if self.latency_min is None or latency < self.latency_min:
-                self.latency_min = latency
-            if self.latency_max is None or latency > self.latency_max:
-                self.latency_max = latency
-
-    async def record_error(self, error_type: str, latency: Optional[float]) -> None:
-        async with self.lock:
-            self.completed += 1
-            self.failed += 1
-            self.error_counts[error_type] += 1
-            if latency is not None:
-                self.latency_sum += latency
-                if self.latency_min is None or latency < self.latency_min:
-                    self.latency_min = latency
-                if self.latency_max is None or latency > self.latency_max:
-                    self.latency_max = latency
-
-    async def snapshot(self) -> dict:
-        async with self.lock:
-            return {
-                "sent": self.sent,
-                "completed": self.completed,
-                "success": self.success,
-                "failed": self.failed,
-                "validation_failed": self.validation_failed,
-                "bytes_received": self.bytes_received,
-                "latency_sum": self.latency_sum,
-                "latency_min": self.latency_min,
-                "latency_max": self.latency_max,
-                "status_counts": dict(self.status_counts),
-                "error_counts": dict(self.error_counts),
-            }
+def setup_event_loop_policy() -> None:
+    """Call before asyncio.run (Windows compatibility)."""
+    if platform.system() == "Windows" and sys.version_info >= (3, 8):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    warnings.filterwarnings("ignore", category=ResourceWarning)
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 
-def parse_headers(header_list: List[str]) -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    for item in header_list:
-        if ":" not in item:
-            raise ValueError(f"Invalid header: {item!r}. Use 'Key: Value'.")
-        key, value = item.split(":", 1)
-        headers[key.strip()] = value.strip()
-    return headers
-
-
-async def request_worker(
-    worker_id: int,
-    queue: asyncio.Queue,
-    session: aiohttp.ClientSession,
-    stats: Stats,
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    data: Optional[str],
-    expect_status: int,
-    expect_text: Optional[str],
-    max_read: int,
-) -> None:
-    loop = asyncio.get_running_loop()
-    while True:
-        item = await queue.get()
-        if item is None:
-            queue.task_done()
-            break
-
-        start = loop.time()
-        try:
-            async with session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                data=data,
-            ) as response:
-                body = await response.content.read(max_read)
-                latency = loop.time() - start
-                status_ok = response.status == expect_status
-                text_ok = True
-                if expect_text is not None:
-                    text_ok = expect_text in body.decode(errors="ignore")
-                ok = status_ok and text_ok
-                await stats.record_response(
-                    response.status,
-                    ok=ok,
-                    latency=latency,
-                    body_size=len(body),
-                    validation_failed=not ok,
-                )
-        except Exception as exc:  # noqa: BLE001 - load test needs catch-all
-            latency = loop.time() - start
-            await stats.record_error(type(exc).__name__, latency)
-        finally:
-            queue.task_done()
-
-
-async def producer(
-    queue: asyncio.Queue,
-    stats: Stats,
-    rate: int,
-    duration: int,
-) -> None:
-    loop = asyncio.get_running_loop()
-    start = loop.time()
-    for second in range(duration):
-        target = start + second + 1
-        for _ in range(rate):
-            queue.put_nowait(1)
-        await stats.record_sent(rate)
-        sleep_for = target - loop.time()
-        if sleep_for > 0:
-            await asyncio.sleep(sleep_for)
-
-
-def format_counter(counter: dict, limit: int = 6) -> str:
-    if not counter:
-        return "-"
-    items = sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))
-    parts = [f"{k}:{v}" for k, v in items[:limit]]
-    if len(items) > limit:
-        parts.append("...")
-    return " ".join(parts)
-
-
-async def reporter(stats: Stats, interval: float, stop_event: asyncio.Event, start_ts: float) -> None:
-    while not stop_event.is_set():
-        await asyncio.sleep(interval)
-        snapshot = await stats.snapshot()
-        elapsed = time.monotonic() - start_ts
-        completed = snapshot["completed"]
-        rps = completed / elapsed if elapsed > 0 else 0.0
-        avg_latency = snapshot["latency_sum"] / completed if completed else 0.0
-        print(
-            f"[{elapsed:6.1f}s] sent={snapshot['sent']} "
-            f"done={completed} ok={snapshot['success']} "
-            f"fail={snapshot['failed']} "
-            f"rps={rps:0.1f} avg={avg_latency*1000:0.1f}ms",
-            flush=True,
-        )
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Async load generator: send 500 rps for 5 minutes."
-    )
-    parser.add_argument("--url", required=True, help="Target URL.")
-    parser.add_argument("--method", default="GET", help="HTTP method.")
-    parser.add_argument("--rate", type=int, default=500, help="Requests per second.")
-    parser.add_argument("--duration", type=int, default=300, help="Duration in seconds.")
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=None,
-        help="Max concurrent requests (default: rate*2).",
-    )
-    parser.add_argument("--timeout", type=float, default=10.0, help="Total timeout.")
-    parser.add_argument(
-        "--report-interval",
-        type=float,
-        default=1.0,
-        help="Progress output interval in seconds.",
-    )
-    parser.add_argument(
-        "--expect-status",
-        type=int,
-        default=200,
-        help="Expected HTTP status for success.",
-    )
-    parser.add_argument(
-        "--expect-text",
-        default=None,
-        help="Optional substring to validate in response.",
-    )
-    parser.add_argument(
-        "--max-read",
-        type=int,
-        default=65536,
-        help="Max bytes to read from response body.",
-    )
-    parser.add_argument(
-        "--header",
-        action="append",
-        default=[],
-        help="HTTP header (repeatable). Format: 'Key: Value'.",
-    )
-    parser.add_argument(
-        "--data",
-        default=None,
-        help="Optional request body (string).",
-    )
-    return parser
-
-
-async def run(args: argparse.Namespace) -> int:
-    if args.rate <= 0:
-        raise ValueError("--rate must be > 0")
-    if args.duration <= 0:
-        raise ValueError("--duration must be > 0")
-    if args.concurrency is None:
-        args.concurrency = max(100, args.rate * 2)
-    if args.concurrency <= 0:
-        raise ValueError("--concurrency must be > 0")
-    if args.report_interval <= 0:
-        raise ValueError("--report-interval must be > 0")
-
-    headers = parse_headers(args.header)
-    stats = Stats()
-    queue: asyncio.Queue = asyncio.Queue()
-    stop_event = asyncio.Event()
-
-    connector = aiohttp.TCPConnector(limit=args.concurrency)
-    timeout = aiohttp.ClientTimeout(total=args.timeout)
-
-    start_ts = time.monotonic()
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        workers = [
-            asyncio.create_task(
-                request_worker(
-                    worker_id=i,
-                    queue=queue,
-                    session=session,
-                    stats=stats,
-                    method=args.method,
-                    url=args.url,
-                    headers=headers,
-                    data=args.data,
-                    expect_status=args.expect_status,
-                    expect_text=args.expect_text,
-                    max_read=args.max_read,
-                )
-            )
-            for i in range(args.concurrency)
-        ]
-        reporter_task = asyncio.create_task(
-            reporter(stats, args.report_interval, stop_event, start_ts)
-        )
-
-        await producer(queue, stats, args.rate, args.duration)
-        await queue.join()
-
-        for _ in range(args.concurrency):
-            queue.put_nowait(None)
-        await asyncio.gather(*workers)
-        stop_event.set()
-        await reporter_task
-
-    snapshot = await stats.snapshot()
-    elapsed = time.monotonic() - start_ts
-    avg_latency = (
-        snapshot["latency_sum"] / snapshot["completed"]
-        if snapshot["completed"]
-        else 0.0
-    )
-    print("\n=== Summary ===")
-    print(f"elapsed: {elapsed:0.2f}s")
-    print(f"sent: {snapshot['sent']}")
-    print(f"completed: {snapshot['completed']}")
-    print(f"success: {snapshot['success']}")
-    print(f"failed: {snapshot['failed']}")
-    print(f"validation_failed: {snapshot['validation_failed']}")
-    print(f"avg_latency: {avg_latency*1000:0.2f}ms")
-    if snapshot["latency_min"] is not None:
-        print(f"min_latency: {snapshot['latency_min']*1000:0.2f}ms")
-    if snapshot["latency_max"] is not None:
-        print(f"max_latency: {snapshot['latency_max']*1000:0.2f}ms")
-    print(f"bytes_received: {snapshot['bytes_received']}")
-    print(f"status_counts: {format_counter(snapshot['status_counts'])}")
-    print(f"error_counts: {format_counter(snapshot['error_counts'])}")
-    return 0
-
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def _to_int(value: Any, default: int) -> int:
     try:
-        return asyncio.run(run(args))
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        return 130
-    except Exception as exc:  # noqa: BLE001 - CLI guard
-        print(f"Error: {exc}", file=sys.stderr)
-        return 2
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_tokens(tokens_obj: Any) -> List[Tuple[str, str]]:
+    """
+    Accept multiple token formats:
+    - [(account, token), ...]
+    - {"account": "token", ...}
+    - (("account", "token"), ...)
+    Return List[(account, token)].
+    """
+    if tokens_obj is None:
+        return []
+    if isinstance(tokens_obj, dict):
+        return [(str(k), str(v)) for k, v in tokens_obj.items()]
+    if isinstance(tokens_obj, (list, tuple)):
+        out: List[Tuple[str, str]] = []
+        for item in tokens_obj:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append((str(item[0]), str(item[1])))
+            else:
+                raise ValueError(f"Invalid tokens entry: {item!r}")
+        return out
+    raise ValueError(f"Unsupported tokens type: {type(tokens_obj)!r}")
+
+
+class MarketOrder:
+    """Market order open."""
+
+    def __init__(self) -> None:
+        self.config = WEBSOCKET_PRIVATE_CONFIG
+
+        self.batch_size = _to_int(self.config.get("batch_size", 1000), 1000)
+        self.sleep_time = _to_float(self.config.get("sleep_time", 0), 0.0)
+
+        self.client_ids = list(self.config.get("client_ids", []))
+        self.client_id_cycle = itertools.cycle(self.client_ids)
+        self.accounts_headers: List[Tuple[str, Dict[str, str]]] = []
+
+        self.order_data = {
+            "eventType": "marketOrder",
+            "eventData": {
+                "action": "open",
+                "orderFrom": "SELF",
+                "symbolCode": "EURUSD",
+                "side": "1",
+                "leverage": "100",
+                "price": "1.19000",
+                "openOrderAmt": "100",
+            },
+        }
+
+        max_concurrency = _to_int(self.config.get("max_concurrency", self.batch_size), self.batch_size)
+        self._max_concurrency = max(1, max_concurrency)
+        self._semaphore = asyncio.Semaphore(self._max_concurrency)
+
+        self._max_retries = max(1, _to_int(self.config.get("max_retries", 2), 2))
+        self._retry_delay = max(0.0, _to_float(self.config.get("retry_delay", 0.5), 0.5))
+        self._open_timeout = max(0.1, _to_float(self.config.get("open_timeout", 3.0), 3.0))
+        self._close_wait_timeout = max(1.0, _to_float(self.config.get("close_wait_timeout", 5.0), 5.0))
+
+    async def generate_header(self) -> List[Tuple[str, Dict[str, str]]]:
+        """Build headers for each account."""
+        try:
+            tokens_str = OperateConfig().get_ini_value("PARAMS", "tokens")
+            if not tokens_str:
+                logger.log_out("error", "tokens config is empty")
+                return []
+
+            try:
+                tokens_obj = ast.literal_eval(tokens_str)
+            except (ValueError, SyntaxError) as exc:
+                logger.log_out("error", f"tokens config invalid: {exc}")
+                return []
+
+            pairs = _normalize_tokens(tokens_obj)
+            if not pairs:
+                logger.log_out("error", "tokens config produced no entries")
+                return []
+            if not self.client_ids:
+                logger.log_out("error", "client_ids is empty")
+                return []
+
+            accounts_headers: List[Tuple[str, Dict[str, str]]] = []
+            next_client_id = self.client_id_cycle.__next__
+            for account, token in pairs:
+                headers = {
+                    "Access-Token": token,
+                    "Client-ID": next_client_id(),
+                }
+                accounts_headers.append((str(account), headers))
+
+            self.accounts_headers = accounts_headers
+            return accounts_headers
+        except KeyboardInterrupt:
+            logger.log_out("info", "User interrupted")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.log_out("error", f"Failed to build headers: {exc}")
+        return []
+
+    async def receive_websocket_messages(
+        self, websocket: websockets.WebSocketClientProtocol, account_name: str, timeout_duration: float
+    ) -> int:
+        """Receive WebSocket messages."""
+        if timeout_duration <= 0:
+            return 0
+
+        message_count = 0
+        try:
+            recv = websocket.recv
+            log_out = logger.log_out
+            loads = json.loads
+
+            while True:
+                try:
+                    message = await asyncio.wait_for(recv(), timeout=timeout_duration)
+                    try:
+                        message_data = loads(message)
+                    except json.JSONDecodeError:
+                        log_out("warning", f"Account {account_name} - message is not JSON: {message!r}")
+                        continue
+                    message_count += 1
+                    log_out("debug", f"Account {account_name} - message: {message_data}")
+                except asyncio.TimeoutError:
+                    log_out("info", f"Account {account_name} - receive done, total {message_count}")
+                    break
+        finally:
+            if websocket and not websocket.closed:
+                try:
+                    await websocket.close()
+                    logger.log_out("info", f"Account {account_name} - WebSocket closed")
+                except Exception as exc:
+                    logger.log_out("warning", f"Account {account_name} - close error: {exc}")
+        return message_count
+
+    async def send_trading_request(self, account_name: str, headers: Dict[str, str]) -> None:
+        """Send trading request and optionally receive responses."""
+        url = self.config.get("websocket_url")
+        if not url:
+            logger.log_out("error", "websocket_url is missing")
+            return
+
+        receive_timeout = max(0.0, _to_float(self.config.get("receive_timeout", 0), 0.0))
+        for attempt in range(1, self._max_retries + 1):
+            websocket = None
+            try:
+                async with self._semaphore:
+                    websocket = await websockets.connect(
+                        url,
+                        extra_headers=headers,
+                        close_timeout=10,
+                        ping_interval=30,
+                        ping_timeout=10,
+                        open_timeout=self._open_timeout,
+                    )
+                    logger.log_out("info", f"Account {account_name} - WebSocket connected")
+
+                    request_message = json.dumps(self.order_data, ensure_ascii=False)
+                    await websocket.send(request_message)
+                    logger.log_out("info", f"Account {account_name} - order sent: {self.order_data['eventData']}")
+
+                    if receive_timeout <= 0:
+                        await websocket.close()
+                        logger.log_out("info", f"Account {account_name} - receive disabled, closed")
+                        return
+
+                    await self.receive_websocket_messages(websocket, account_name, receive_timeout)
+                    return
+            except websockets.exceptions.WebSocketException as exc:
+                logger.log_out(
+                    "error", f"Account {account_name} - WebSocket error (attempt {attempt}): {exc}"
+                )
+            except Exception as exc:
+                logger.log_out(
+                    "error", f"Account {account_name} - unexpected error (attempt {attempt}): {exc}"
+                )
+
+            if websocket and not websocket.closed:
+                try:
+                    await websocket.close()
+                except Exception as exc:
+                    logger.log_out("warning", f"Account {account_name} - close error: {exc}")
+
+            if attempt < self._max_retries and self._retry_delay > 0:
+                await asyncio.sleep(self._retry_delay * attempt)
+            else:
+                logger.log_out(
+                    "error",
+                    f"Account {account_name} - reached max retries ({self._max_retries})",
+                )
+
+    async def send_subscribe_request(self) -> None:
+        """Send trading request for each account."""
+        headers_list = await self.generate_header()
+        if not headers_list:
+            logger.log_out("error", "No headers available, skip trading requests")
+            return
+
+        tasks = []
+        for account_name, headers in headers_list:
+            tasks.append(asyncio.create_task(self.send_trading_request(account_name, headers)))
+            if self.sleep_time > 0:
+                await asyncio.sleep(self.sleep_time)
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.log_out("error", f"Task {i} failed: {result}")
+
+        logger.log_out("info", "All account trading requests finished")
+
+    async def close(self) -> None:
+        """Cleanup resources."""
+        await asyncio.sleep(0)
+        logger.log_out("info", "Cleanup completed")
+
+
+async def main() -> None:
+    main_start_time = time.time()
+    market_order = MarketOrder()
+    try:
+        logger.log_out("info", "Start sending WebSocket requests...")
+        await market_order.send_subscribe_request()
+    finally:
+        await market_order.close()
+
+    main_end_time = time.time()
+    logger.log_out("info", f"Done. Total time: {main_end_time - main_start_time:.4f}s")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    setup_event_loop_policy()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.log_out("info", "User interrupted")
+    except Exception as exc:
+        logger.log_out("error", f"Execution failed: {exc}")
