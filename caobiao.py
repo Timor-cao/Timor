@@ -171,6 +171,9 @@ class MarketOrder:
                 except asyncio.TimeoutError:
                     log_out("info", f"Account {account_name} - receive done, total {message_count}")
                     break
+        except asyncio.CancelledError:
+            logger.log_out("warning", f"Account {account_name} - receive cancelled")
+            raise
         finally:
             if websocket and not websocket.closed:
                 try:
@@ -213,6 +216,13 @@ class MarketOrder:
 
                     await self.receive_websocket_messages(websocket, account_name, receive_timeout)
                     return
+            except asyncio.CancelledError:
+                if websocket and not websocket.closed:
+                    try:
+                        await websocket.close()
+                    except Exception as exc:
+                        logger.log_out("warning", f"Account {account_name} - close error: {exc}")
+                raise
             except websockets.exceptions.WebSocketException as exc:
                 logger.log_out(
                     "error", f"Account {account_name} - WebSocket error (attempt {attempt}): {exc}"
@@ -244,16 +254,23 @@ class MarketOrder:
             return
 
         tasks = []
-        for account_name, headers in headers_list:
-            tasks.append(asyncio.create_task(self.send_trading_request(account_name, headers)))
-            if self.sleep_time > 0:
-                await asyncio.sleep(self.sleep_time)
+        try:
+            for account_name, headers in headers_list:
+                tasks.append(asyncio.create_task(self.send_trading_request(account_name, headers)))
+                if self.sleep_time > 0:
+                    await asyncio.sleep(self.sleep_time)
 
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.log_out("error", f"Task {i} failed: {result}")
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.log_out("error", f"Task {i} failed: {result}")
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         logger.log_out("info", "All account trading requests finished")
 
