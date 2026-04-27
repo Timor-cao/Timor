@@ -12,6 +12,7 @@ import copy
 import inspect
 import itertools
 import json
+import os
 import platform
 import ssl
 import statistics
@@ -44,6 +45,11 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
+def _get_env_or_config(config: Dict[str, Any], env_name: str, config_name: str, default: Any) -> Any:
+    """优先读取环境变量，未设置时读取配置，最后使用默认值。"""
+    return os.getenv(env_name, config.get(config_name, default))
+
+
 def setup_event_loop_policy() -> None:
     """在 asyncio.run 之前调用，适配 Windows 事件循环策略。"""
     if platform.system() == "Windows" and sys.version_info >= (3, 8):
@@ -58,7 +64,34 @@ class MarketOrder:
     def __init__(self) -> None:
         self.config = WEBSOCKET_PRIVATE_CONFIG
         self.url = self.config["websocket_url"]
-        self.orders_per_second = max(0.001, float(self.config.get("orders_per_second", 200)))
+        self.worker_index = int(
+            _get_env_or_config(self.config, "WORKER_INDEX", "worker_index", 0)
+        )
+        self.worker_count = max(
+            1,
+            int(_get_env_or_config(self.config, "WORKER_COUNT", "worker_count", 1)),
+        )
+        if not 0 <= self.worker_index < self.worker_count:
+            raise ValueError("WORKER_INDEX 必须在 [0, WORKER_COUNT) 范围内")
+
+        configured_rate = float(self.config.get("orders_per_second", 200))
+        self.global_rate = max(
+            0.001,
+            float(_get_env_or_config(self.config, "GLOBAL_RATE", "global_rate", configured_rate)),
+        )
+        self.orders_per_second = max(0.001, self.global_rate / self.worker_count)
+        self.start_at = float(_get_env_or_config(self.config, "START_AT", "start_at", 0))
+        self.run_id = str(_get_env_or_config(self.config, "RUN_ID", "run_id", "local"))
+        self.result_file = str(
+            _get_env_or_config(
+                self.config,
+                "RESULT_FILE",
+                "result_file",
+                f"market_order_results_{self.run_id}.jsonl",
+            )
+        )
+        self.assigned_account_count = 0
+        self.total_account_count = 0
         self.connection_concurrency = max(
             1, int(self.config.get("connection_concurrency", 100))
         )
@@ -88,6 +121,7 @@ class MarketOrder:
         self.send_delays_ms: List[float] = []
         self.send_errors = 0
         self.sent_count = 0
+        self.connections_ready_count = 0
         self.send_total_time = 0.0
         self.close_total_time = 0.0
 
@@ -104,6 +138,12 @@ class MarketOrder:
                 "reqTime": int(time.time() * 1000000),
             },
         }
+        logger.log_out(
+            "info",
+            f"Worker {self.worker_index}/{self.worker_count} 初始化完成，"
+            f"run_id={self.run_id}, 全局目标速率={self.global_rate:.2f}/秒，"
+            f"本 Worker 目标速率={self.orders_per_second:.2f}/秒",
+        )
 
     def _load_tokens(self) -> Sequence[Tuple[Any, str, Any]]:
         """兼容常见配置位置读取账号 token。"""
@@ -142,9 +182,22 @@ class MarketOrder:
                     "Client-ID": next(self.client_id_cycle),
                 }
 
-            self.cached_headers = accounts_headers
-            logger.log_out("info", f"请求头已生成，共 {len(accounts_headers)} 个账号")
-            return list(accounts_headers.items())
+            all_headers = list(accounts_headers.items())
+            sharded_headers = [
+                item
+                for index, item in enumerate(all_headers)
+                if index % self.worker_count == self.worker_index
+            ]
+            self.total_account_count = len(all_headers)
+            self.assigned_account_count = len(sharded_headers)
+            self.cached_headers = dict(sharded_headers)
+            logger.log_out(
+                "info",
+                f"请求头已生成，共 {self.total_account_count} 个账号；"
+                f"Worker {self.worker_index}/{self.worker_count} 分配 "
+                f"{self.assigned_account_count} 个账号",
+            )
+            return sharded_headers
         except KeyboardInterrupt:
             logger.log_out("info", "用户中断程序执行")
             return []
@@ -237,6 +290,7 @@ class MarketOrder:
             "info",
             f"连接预热完成，可用连接 {len(connections)}/{len(headers_items)} 条",
         )
+        self.connections_ready_count = len(connections)
         return connections
 
     def _build_request_message(self) -> str:
@@ -333,7 +387,7 @@ class MarketOrder:
 
         loop = asyncio.get_running_loop()
         interval = 1.0 / self.orders_per_second
-        start_time = loop.time() + float(self.config.get("start_delay", 0.2))
+        start_time = self._resolve_start_time(loop)
         first_send_time: Optional[float] = None
         last_send_time: Optional[float] = None
 
@@ -379,6 +433,26 @@ class MarketOrder:
             self.send_total_time = max(last_send_time - first_send_time, interval)
         self._log_send_statistics()
 
+    def _resolve_start_time(self, loop: asyncio.AbstractEventLoop) -> float:
+        """解析本轮发送开始时间；分布式模式建议所有 Worker 使用同一个 START_AT。"""
+        if self.start_at > 0:
+            wall_delay = self.start_at - time.time()
+            if wall_delay > 0:
+                logger.log_out(
+                    "info",
+                    f"Worker {self.worker_index}/{self.worker_count} 等待统一开始时间 "
+                    f"START_AT={self.start_at:.6f}，剩余 {wall_delay:.3f} 秒",
+                )
+                return loop.time() + wall_delay
+
+            logger.log_out(
+                "warning",
+                f"START_AT={self.start_at:.6f} 已早于当前时间，将立即开始发送",
+            )
+            return loop.time()
+
+        return loop.time() + float(self.config.get("start_delay", 0.2))
+
     def _log_send_statistics(self) -> None:
         elapsed = self.send_total_time
         actual_rate = self.sent_count / elapsed if elapsed > 0 else 0
@@ -404,6 +478,48 @@ class MarketOrder:
             f"avg={avg_delay:.3f}, max={max_delay:.3f}, "
             f"p95={p95_delay:.3f}, p99={p99_delay:.3f}",
         )
+
+    def build_result(self, round_index: int, round_total_time: float) -> Dict[str, Any]:
+        """构造当前 Worker 的压测结果，便于分布式汇总。"""
+        sorted_delays = sorted(self.send_delays_ms)
+        avg_delay = statistics.fmean(sorted_delays) if sorted_delays else 0.0
+        max_delay = max(sorted_delays) if sorted_delays else 0.0
+
+        return {
+            "run_id": self.run_id,
+            "round_index": round_index,
+            "worker_index": self.worker_index,
+            "worker_count": self.worker_count,
+            "global_rate": self.global_rate,
+            "worker_rate": self.orders_per_second,
+            "accounts_total": self.total_account_count,
+            "accounts_assigned": self.assigned_account_count,
+            "connections_ready": self.connections_ready_count,
+            "sent_count": self.sent_count,
+            "send_errors": self.send_errors,
+            "send_total_time": self.send_total_time,
+            "round_total_time": round_total_time,
+            "actual_rate": self.sent_count / self.send_total_time
+            if self.send_total_time > 0
+            else 0.0,
+            "delay_avg_ms": avg_delay,
+            "delay_max_ms": max_delay,
+            "delay_p95_ms": self._percentile(sorted_delays, 95),
+            "delay_p99_ms": self._percentile(sorted_delays, 99),
+        }
+
+    def write_result(self, round_index: int, round_total_time: float) -> None:
+        """把当前 Worker 结果写入 JSONL 文件；多机结果可按 run_id 汇总。"""
+        if not self.result_file:
+            return
+
+        result = self.build_result(round_index, round_total_time)
+        try:
+            with open(self.result_file, "a", encoding="utf-8") as file_obj:
+                file_obj.write(json.dumps(result, ensure_ascii=False) + "\n")
+            logger.log_out("info", f"Worker 结果已写入: {self.result_file}")
+        except Exception as exc:
+            logger.log_out("error", f"写入 Worker 结果失败: {exc}")
 
     @staticmethod
     def _percentile(sorted_values: Sequence[float], percentile: float) -> float:
@@ -470,9 +586,11 @@ async def run_once(round_index: int) -> None:
         except Exception as close_error:
             logger.log_out("error", f"第 {round_index} 轮资源关闭异常: {close_error}")
 
+    round_total_time = time.perf_counter() - round_start
+    market_order.write_result(round_index, round_total_time)
     logger.log_out(
         "info",
-        f"第 {round_index} 轮执行完成，总耗时: {time.perf_counter() - round_start:.4f} 秒",
+        f"第 {round_index} 轮执行完成，总耗时: {round_total_time:.4f} 秒",
     )
 
 
