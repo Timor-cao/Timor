@@ -70,6 +70,13 @@ class MarketOrder:
         self.max_retries = max(1, int(self.config.get("max_retries", 2)))
         self.retry_delay = max(0.0, float(self.config.get("retry_delay", 0.5)))
         self.spin_threshold = max(0.0, float(self.config.get("spin_threshold", 0.001)))
+        self.busy_spin_threshold = max(
+            0.0,
+            min(
+                self.spin_threshold,
+                float(self.config.get("busy_spin_threshold", 0.0002)),
+            ),
+        )
         self.log_each_send = _to_bool(self.config.get("log_each_send"), False)
 
         self.client_id_cycle = itertools.cycle(self.config["client_ids"])
@@ -239,7 +246,13 @@ class MarketOrder:
         return json.dumps(order_data, ensure_ascii=False)
 
     async def _wait_until(self, target_time: float) -> None:
-        """基于事件循环单调时钟等待到绝对目标时间。"""
+        """基于事件循环单调时钟等待到绝对目标时间。
+
+        等待分三段：
+        1. 距离目标时间较远时用 asyncio.sleep，降低 CPU 占用；
+        2. 进入 spin_threshold 后用 sleep(0) 主动让出控制权，减少粗睡眠误差；
+        3. 最后 busy_spin_threshold 内做短暂忙等，尽量贴近目标发送时刻。
+        """
         loop = asyncio.get_running_loop()
         delay = target_time - loop.time()
         if delay <= 0:
@@ -247,6 +260,19 @@ class MarketOrder:
 
         if self.spin_threshold > 0 and delay > self.spin_threshold:
             await asyncio.sleep(delay - self.spin_threshold)
+
+        if self.busy_spin_threshold > 0:
+            while True:
+                remaining = target_time - loop.time()
+                if remaining <= 0:
+                    return
+                if remaining <= self.busy_spin_threshold:
+                    break
+                await asyncio.sleep(0)
+
+            while loop.time() < target_time:
+                pass
+            return
 
         while loop.time() < target_time:
             await asyncio.sleep(0)
