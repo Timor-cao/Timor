@@ -8,6 +8,7 @@
 import ast
 import json
 import ssl
+import time
 import warnings
 from threading import Lock
 
@@ -110,12 +111,24 @@ class MarketOrderUser(User):
                 finally:
                     self.websocket = None
 
+    def _fire_request_event(self, name, start_time, exception=None):
+        """上报到 Locust，用于统计 WebSocket 发出的请求数和失败数"""
+        self.environment.events.request.fire(
+            request_type="WebSocket",
+            name=name,
+            response_time=(time.perf_counter() - start_time) * 1000,
+            response_length=0,
+            exception=exception,
+            context={"account": self.account_name},
+        )
+
     def _connect_ws(self):
         """建立 WebSocket 长连接，成功返回 True"""
         if self._is_connected():
             return True
         if not self.headers:
             return False
+        start_time = time.perf_counter()
         try:
             header_list = [f"{k}: {v}" for k, v in self.headers.items()]
             ws = websocket.create_connection(
@@ -129,9 +142,11 @@ class MarketOrderUser(User):
             with self._ws_lock:
                 self.websocket = ws
             logger.log_out("info", f"[{self.account_name}] WebSocket 长连接建立成功")
+            self._fire_request_event("websocket_connect", start_time)
             return True
         except Exception as e:
             logger.log_out("error", f"[{self.account_name}] 建立连接失败: {type(e).__name__}: {e}")
+            self._fire_request_event("websocket_connect", start_time, e)
             self._close_ws()
             return False
 
@@ -155,13 +170,18 @@ class MarketOrderUser(User):
                 break
             if not self._is_connected():
                 continue
+            start_time = time.perf_counter()
+            exc = None
             try:
                 with self._ws_lock:
                     self.websocket.ping()
                 logger.log_out("debug", f"[{self.account_name}] WebSocket 心跳成功")
             except Exception as e:
+                exc = e
                 logger.log_out("error", f"[{self.account_name}] 心跳失败: {type(e).__name__}: {e}")
                 self._close_ws()
+            finally:
+                self._fire_request_event("websocket_ping", start_time, exc)
 
     # ----------------- Locust 生命周期 -----------------
 
@@ -209,3 +229,9 @@ class MarketOrderUser(User):
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
     logger.log_out("info", "测试停止，正在生成最终报告...")
+    for request_name in ("websocket_connect", "websocket_ping"):
+        stats = environment.stats.get(request_name, "WebSocket")
+        logger.log_out(
+            "info",
+            f"{request_name} 请求数: {stats.num_requests}, 失败数: {stats.num_failures}",
+        )
